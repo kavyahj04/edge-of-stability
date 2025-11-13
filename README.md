@@ -33,7 +33,7 @@ gd.py [dataset] [arch_id] [loss] [lr] [max_steps]
 
 For example:
 ```
-python src/gd.py cifar10-5k fc-tanh  mse  0.01 100000 --acc_goal 0.99 --neigs 2  --eig_freq 100
+python src/gd.py cifar10-5k fc-tanh  mse  0.01 100000 --acc_goal 0.99 --neigs 2  --eig_freq 50
 ```
 The above command will train a fully-connected tanh network (`fc-tanh`) on a 5k subset of CIFAR-10 (`cifar10-5k`) using the square loss (`mse`).
 We will run vanila gradient descent with step size 0.01 (`lr`).
