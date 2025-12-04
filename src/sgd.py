@@ -1,177 +1,179 @@
-import os
-import argparse
+from os import makedirs
+
 import torch
-import torch.nn as nn
-import torch.optim as optim
+from torch.nn.utils import parameters_to_vector
 from torch.utils.data import DataLoader, RandomSampler
 
-# Import from repo
-from datasets import get_dataset
-from archs import build_architecture
-from hessian import compute_top_eigenvalues  # same function used in gd.py
-from utils import AverageMeter, accuracy, set_seed
+import argparse
+
+from archs import load_architecture
+from utilities import (
+    get_loss_and_acc,
+    compute_losses,
+    save_files,
+    save_files_final,
+    get_hessian_eigenvalues,
+    iterate_dataset,
+    get_gd_directory
+)
+from data import load_dataset, take_first, DATASETS
 
 
-############################################################
-#                  SGD TRAINING LOOP
-############################################################
-
-def train_sgd(
-    dataset_name,
-    arch_name,
-    loss_name,
-    lr,
-    batch_size,
-    max_steps,
-    neigs,
-    eig_freq,
-    seed,
-    device="cuda"
-):
-
-    set_seed(seed)
-
-    print(f"\n=== SGD TRAINING ===")
-    print(f"Dataset: {dataset_name}")
-    print(f"Arch: {arch_name}")
-    print(f"Loss: {loss_name}")
-    print(f"Learning rate: {lr}")
-    print(f"Batch size: {batch_size}")
-    print(f"Max steps: {max_steps}")
-    print(f"Eigen freq: {eig_freq}\n")
+def main(dataset: str, arch_id: str, loss: str, lr: float, max_steps: int,
+         batch_size: int = 128, neigs: int = 0,
+         eig_freq: int = -1, iterate_freq: int = -1, save_freq: int = -1,
+         save_model: bool = False, seed: int = 0, abridged_size: int = 5000):
 
     ############################################################
-    #                 LOAD DATA
+    #  Directory
     ############################################################
-    train_data, test_data, num_classes = get_dataset(dataset_name)
+    directory = get_gd_directory(dataset, lr, arch_id, seed, "sgd", loss, beta=0.0)
+    print(f"output directory: {directory}")
+    makedirs(directory, exist_ok=True)
+
+    ############################################################
+    #  Dataset
+    ############################################################
+    train_dataset, test_dataset = load_dataset(dataset, loss)
+    abridged_train = take_first(train_dataset, abridged_size)
+
     train_loader = DataLoader(
-        train_data,
+        train_dataset,
         batch_size=batch_size,
-        sampler=RandomSampler(train_data),
+        sampler=RandomSampler(train_dataset),
         drop_last=True
     )
 
-    ############################################################
-    #                 BUILD MODEL
-    ############################################################
-    model = build_architecture(arch_name, num_classes=num_classes).to(device)
-
-    if loss_name == "mse":
-        criterion = nn.MSELoss()
-    elif loss_name == "ce":
-        criterion = nn.CrossEntropyLoss()
-    else:
-        raise ValueError("Unsupported loss type")
-
-    optimizer = optim.SGD(model.parameters(), lr=lr)
+    loss_fn, acc_fn = get_loss_and_acc(loss)
 
     ############################################################
-    #       TRAINING METRICS + STORAGE
+    #  Model and Optimizer
     ############################################################
-    losses = []
-    accs = []
-    eig_history = []
+    torch.manual_seed(seed)
+    network = load_architecture(arch_id, dataset).cuda()
 
+    optimizer = torch.optim.SGD(network.parameters(), lr=lr)
+
+    ############################################################
+    #  Storage Arrays
+    ############################################################
+    train_loss = torch.zeros(max_steps)
+    test_loss = torch.zeros(max_steps)
+    train_acc = torch.zeros(max_steps)
+    test_acc = torch.zeros(max_steps)
+
+    eigs = torch.zeros(max_steps // eig_freq if eig_freq > 0 else 0, neigs)
+    iterates = torch.zeros(max_steps // iterate_freq if iterate_freq > 0 else 0,
+                           len(parameters_to_vector(network.parameters())))
+
+    ############################################################
+    #  Training Loop
+    ############################################################
     step = 0
-    model.train()
+    loader_iter = iter(train_loader)
 
-    ############################################################
-    #                 TRAINING LOOP
-    ############################################################
     while step < max_steps:
-        for xb, yb in train_loader:
-            xb, yb = xb.to(device), yb.to(device)
 
-            optimizer.zero_grad()
-            out = model(xb)
-            loss = criterion(out, yb)
-            loss.backward()
-            optimizer.step()
+        # compute train & test losses each step
+        train_loss[step], train_acc[step] = compute_losses(
+            network, [loss_fn, acc_fn], train_dataset, batch_size
+        )
+        test_loss[step], test_acc[step] = compute_losses(
+            network, [loss_fn, acc_fn], test_dataset, batch_size
+        )
 
-            # record
-            losses.append(loss.item())
+        # Hessian eigenvalues
+        if eig_freq != -1 and step % eig_freq == 0:
+            eigs[step // eig_freq, :] = get_hessian_eigenvalues(
+                network, loss_fn, abridged_train, neigs=neigs,
+                physical_batch_size=batch_size
+            )
+            print("eigenvalues:", eigs[step // eig_freq])
 
-            # compute accuracy
-            if loss_name == "ce":
-                accs.append(accuracy(out, yb))
-            else:
-                accs.append(0)  # placeholder for MSE
+        # Save iterates (parameter projections)
+        if iterate_freq != -1 and step % iterate_freq == 0:
+            iterates[step // iterate_freq] = parameters_to_vector(
+                network.parameters()
+            ).detach().cpu()
 
-            # Hessian eigenvalue measurement
-            if neigs > 0 and step % eig_freq == 0:
-                print(f"[Step {step}] Computing top-{neigs} Hessian eigenvalues...")
-                eigvals = compute_top_eigenvalues(
-                    model=model,
-                    dataset=train_data,
-                    criterion=criterion,
-                    device=device,
-                    top_k=neigs
-                )
-                eig_history.append(eigvals)
+        # Save partial files
+        if save_freq != -1 and step % save_freq == 0:
+            save_files(directory, [
+                ("eigs", eigs[:step // eig_freq]),
+                ("iterates", iterates[:step // iterate_freq]),
+                ("train_loss", train_loss[:step]),
+                ("test_loss", test_loss[:step]),
+                ("train_acc", train_acc[:step]),
+                ("test_acc", test_acc[:step]),
+            ])
 
-            step += 1
-            if step >= max_steps:
-                break
+        print(f"{step}\t{train_loss[step]:.3f}\t{train_acc[step]:.3f}\t{test_loss[step]:.3f}\t{test_acc[step]:.3f}")
+
+        # -------------------------------------------
+        # SGD UPDATE
+        # -------------------------------------------
+        try:
+            X, y = next(loader_iter)
+        except StopIteration:
+            loader_iter = iter(train_loader)
+            X, y = next(loader_iter)
+
+        X, y = X.cuda(), y.cuda()
+
+        optimizer.zero_grad()
+        loss_val = loss_fn(network(X), y)
+        loss_val.backward()
+        optimizer.step()
+
+        step += 1
 
     ############################################################
-    #                SAVE RESULTS 
+    # Save Final Files
     ############################################################
-    base_dir = os.environ.get("RESULTS", "./results")
-    out_dir = os.path.join(
-        base_dir,
-        dataset_name,
-        arch_name,
-        "sgd",
-        f"lr_{lr}_bs_{batch_size}_seed_{seed}"
-    )
+    save_files_final(directory, [
+        ("eigs", eigs[:(step) // eig_freq]),
+        ("iterates", iterates[:(step) // iterate_freq]),
+        ("train_loss", train_loss[:step]),
+        ("test_loss", test_loss[:step]),
+        ("train_acc", train_acc[:step]),
+        ("test_acc", test_acc[:step]),
+    ])
 
-    os.makedirs(out_dir, exist_ok=True)
+    if save_model:
+        torch.save(network.state_dict(), f"{directory}/snapshot_final")
 
-    torch.save({
-        "losses": torch.tensor(losses),
-        "accs": torch.tensor(accs),
-        "eigvals": torch.tensor(eig_history),
-        "lr": lr,
-        "batch_size": batch_size,
-        "seed": seed
-    }, os.path.join(out_dir, "results.pt"))
-
-    print(f"\n=== Saved results to: {out_dir} ===\n")
-
-
-
-############################################################
-#                  MAIN SCRIPT ENTRY
-############################################################
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Train using stochastic gradient descent.")
+    parser.add_argument("dataset", type=str, choices=DATASETS, help="dataset")
+    parser.add_argument("arch_id", type=str, help="architecture id")
+    parser.add_argument("loss", type=str, choices=["ce", "mse"], help="loss function")
+    parser.add_argument("lr", type=float, help="learning rate")
+    parser.add_argument("max_steps", type=int, help="number of SGD updates")
 
-    parser.add_argument("dataset", type=str)
-    parser.add_argument("arch", type=str)
-    parser.add_argument("loss", type=str)
-
-    parser.add_argument("--lr", type=float, required=True)
-    parser.add_argument("--batch_size", type=int, required=True)
-    parser.add_argument("--max_steps", type=int, default=20000)
-
-    parser.add_argument("--neigs", type=int, default=1)
-    parser.add_argument("--eig_freq", type=int, default=200)
-
+    parser.add_argument("--batch_size", type=int, default=128, help="SGD mini-batch size")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--neigs", type=int, default=0)
+    parser.add_argument("--eig_freq", type=int, default=-1)
+    parser.add_argument("--iterate_freq", type=int, default=-1)
+    parser.add_argument("--save_freq", type=int, default=-1)
+    parser.add_argument("--abridged_size", type=int, default=5000)
+    parser.add_argument("--save_model", type=bool, default=False)
 
     args = parser.parse_args()
 
-    train_sgd(
-        dataset_name=args.dataset,
-        arch_name=args.arch,
-        loss_name=args.loss,
+    main(
+        dataset=args.dataset,
+        arch_id=args.arch_id,
+        loss=args.loss,
         lr=args.lr,
-        batch_size=args.batch_size,
         max_steps=args.max_steps,
+        batch_size=args.batch_size,
         neigs=args.neigs,
         eig_freq=args.eig_freq,
+        iterate_freq=args.iterate_freq,
+        save_freq=args.save_freq,
+        save_model=args.save_model,
         seed=args.seed,
-        device=args.device
+        abridged_size=args.abridged_size
     )
